@@ -36,6 +36,10 @@ type masterSession struct {
 	stale bool // when set to true, we should refresh sessions on the next call to SetVolume
 }
 
+func (s *wcaSession) ProcessID() uint32 {
+	return s.pid
+}
+
 func newWCASession(
 	logger *zap.SugaredLogger,
 	control *wca.IAudioSessionControl2,

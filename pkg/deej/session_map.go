@@ -23,6 +23,18 @@ type sessionMap struct {
 
 	lastSessionRefresh time.Time
 	unmappedSessions   []Session
+
+	outputLock       sync.Mutex
+	outputEnabled    map[int]bool
+	outputStateKnown map[int]bool
+}
+
+type processIDSession interface {
+	ProcessID() uint32
+}
+
+type processOutputRouter interface {
+	RouteProcessOutput(uint32, string) error
 }
 
 const (
@@ -61,11 +73,13 @@ func newSessionMap(deej *Deej, logger *zap.SugaredLogger, sessionFinder SessionF
 	logger = logger.Named("sessions")
 
 	m := &sessionMap{
-		deej:          deej,
-		logger:        logger,
-		m:             make(map[string][]Session),
-		lock:          &sync.Mutex{},
-		sessionFinder: sessionFinder,
+		deej:             deej,
+		logger:           logger,
+		m:                make(map[string][]Session),
+		lock:             &sync.Mutex{},
+		sessionFinder:    sessionFinder,
+		outputEnabled:    make(map[int]bool),
+		outputStateKnown: make(map[int]bool),
 	}
 
 	logger.Debug("Created session map instance")
@@ -81,6 +95,7 @@ func (m *sessionMap) initialize() error {
 
 	m.setupOnConfigReload()
 	m.setupOnSliderMove()
+	m.setupOnSliderButtonPress()
 
 	return nil
 }
@@ -117,6 +132,15 @@ func (m *sessionMap) getAndAddSessions() error {
 		}
 	}
 
+	for sliderID := 0; sliderID < 5; sliderID++ {
+		m.outputLock.Lock()
+		stateKnown := m.outputStateKnown[sliderID]
+		m.outputLock.Unlock()
+		if stateKnown {
+			m.applySliderOutput(sliderID)
+		}
+	}
+
 	m.logger.Infow("Got all audio sessions successfully", "sessionMap", m)
 
 	return nil
@@ -147,6 +171,87 @@ func (m *sessionMap) setupOnSliderMove() {
 			}
 		}
 	}()
+}
+
+func (m *sessionMap) setupOnSliderButtonPress() {
+	buttonEventsChannel := m.deej.serial.SubscribeToSliderButtonEvents()
+
+	go func() {
+		for {
+			select {
+			case event := <-buttonEventsChannel:
+				if event.ButtonID < 0 || event.ButtonID >= 5 {
+					continue
+				}
+
+				m.outputLock.Lock()
+				m.outputEnabled[event.ButtonID] = event.IsOn
+				m.outputStateKnown[event.ButtonID] = true
+				m.outputLock.Unlock()
+
+				m.logger.Infow("Updated slider output switch", "sliderID", event.ButtonID, "alternateOutput", event.IsOn)
+				m.applySliderOutput(event.ButtonID)
+			}
+		}
+	}()
+}
+
+func (m *sessionMap) applySliderOutput(sliderID int) {
+	if sliderID < 0 || sliderID >= 5 {
+		return
+	}
+	if !strings.EqualFold(m.deej.config.AudioOutputs.Default, "default") {
+		m.logger.Warnw("audio_outputs.default must be 'default'", "value", m.deej.config.AudioOutputs.Default)
+		return
+	}
+	if m.deej.config.AudioOutputs.Alternate == "" {
+		m.logger.Warn("Configure audio_outputs.alternate before using output switches")
+		return
+	}
+
+	router, ok := m.sessionFinder.(processOutputRouter)
+	if !ok {
+		m.logger.Warn("Per-application output routing is unavailable on this platform")
+		return
+	}
+
+	endpointName := ""
+	m.outputLock.Lock()
+	if m.outputEnabled[sliderID] {
+		endpointName = m.deej.config.AudioOutputs.Alternate
+	}
+	m.outputLock.Unlock()
+
+	targets, ok := m.deej.config.SliderMapping.get(sliderID)
+	if !ok {
+		return
+	}
+
+	processIDs := make(map[uint32]struct{})
+	for _, target := range targets {
+		for _, resolvedTarget := range m.resolveTarget(target) {
+			sessions, ok := m.get(resolvedTarget)
+			if !ok {
+				continue
+			}
+			for _, session := range sessions {
+				processSession, ok := session.(processIDSession)
+				if !ok || processSession.ProcessID() == 0 {
+					continue
+				}
+				processIDs[processSession.ProcessID()] = struct{}{}
+			}
+		}
+	}
+
+	for processID := range processIDs {
+		if err := router.RouteProcessOutput(processID, endpointName); err != nil {
+			m.logger.Warnw("Failed to route mapped process to audio output",
+				"processID", processID,
+				"endpoint", endpointName,
+				"error", err)
+		}
+	}
 }
 
 // performance: explain why force == true at every such use to avoid unintended forced refresh spams

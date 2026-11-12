@@ -159,6 +159,10 @@ func (sf *wcaSessionFinder) Release() error {
 	return nil
 }
 
+func (sf *wcaSessionFinder) RouteProcessOutput(processID uint32, endpointName string) error {
+	return setWindowsProcessOutput(processID, endpointName)
+}
+
 func (sf *wcaSessionFinder) getDeviceEnumerator() error {
 
 	// get the IMMDeviceEnumerator (only once)

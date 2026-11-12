@@ -17,6 +17,7 @@ import (
 // as well as loading/file watching logic for deej's configuration file
 type CanonicalConfig struct {
 	SliderMapping *sliderMap
+	AudioOutputs  AudioOutputChoices
 
 	ConnectionInfo struct {
 		COMPort  string
@@ -37,6 +38,11 @@ type CanonicalConfig struct {
 	internalConfig *viper.Viper
 }
 
+type AudioOutputChoices struct {
+	Default   string
+	Alternate string
+}
+
 const (
 	userConfigFilepath     = "config.yaml"
 	internalConfigFilepath = "preferences.yaml"
@@ -49,6 +55,7 @@ const (
 	configType = "yaml"
 
 	configKeySliderMapping       = "slider_mapping"
+	configKeyAudioOutputs        = "audio_outputs"
 	configKeyInvertSliders       = "invert_sliders"
 	configKeyCOMPort             = "com_port"
 	configKeyBaudRate            = "baud_rate"
@@ -222,6 +229,11 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 		cc.userConfig.GetStringMapStringSlice(configKeySliderMapping),
 		cc.internalConfig.GetStringMapStringSlice(configKeySliderMapping),
 	)
+	outputChoices := cc.userConfig.GetStringMapString(configKeyAudioOutputs)
+	cc.AudioOutputs = AudioOutputChoices{
+		Default:   strings.TrimSpace(outputChoices["default"]),
+		Alternate: strings.TrimSpace(outputChoices["alternate"]),
+	}
 
 	// get the rest of the config fields - viper saves us a lot of effort here
 	cc.ConnectionInfo.COMPort = cc.userConfig.GetString(configKeyCOMPort)
