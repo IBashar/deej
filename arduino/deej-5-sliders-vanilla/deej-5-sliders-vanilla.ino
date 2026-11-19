@@ -17,7 +17,7 @@ void setup() {
   for (int i = 0; i < NUM_BUTTONS; i++) {
     pinMode(buttonInputs[i], INPUT_PULLUP);
     buttonReadings[i] = digitalRead(buttonInputs[i]);
-    buttonStates[i] = buttonReadings[i] == LOW;
+    buttonStates[i] = buttonReadings[i] == HIGH;
     buttonChangedAt[i] = millis();
   }
 
@@ -41,7 +41,7 @@ void updateButtonStates() {
     }
 
     if (millis() - buttonChangedAt[i] >= BUTTON_DEBOUNCE_MS) {
-      buttonStates[i] = reading == LOW;
+      buttonStates[i] = reading == HIGH;
     }
   }
 }

@@ -121,8 +121,7 @@ func findRenderEndpointID(endpointName string) (string, error) {
 		}
 
 		if strings.EqualFold(friendlyName, endpointName) {
-			var endpointID string
-			err = endpoint.GetId(&endpointID)
+			endpointID, err := getEndpointID(endpoint)
 			endpoint.Release()
 			if err != nil {
 				return "", fmt.Errorf("get endpoint ID for %q: %w", endpointName, err)
@@ -133,6 +132,35 @@ func findRenderEndpointID(endpointName string) (string, error) {
 	}
 
 	return "", fmt.Errorf("active output endpoint %q was not found", endpointName)
+}
+
+func getEndpointID(endpoint *wca.IMMDevice) (string, error) {
+	var endpointIDPtr uintptr
+	hresult, _, _ := syscall.Syscall(
+		endpoint.VTable().GetId,
+		2,
+		uintptr(unsafe.Pointer(endpoint)),
+		uintptr(unsafe.Pointer(&endpointIDPtr)),
+		0,
+	)
+	if int32(hresult) < 0 {
+		return "", fmt.Errorf("IMMDevice.GetId returned HRESULT 0x%08X", uint32(hresult))
+	}
+	if endpointIDPtr == 0 {
+		return "", errors.New("IMMDevice.GetId returned a nil endpoint ID")
+	}
+	defer ole.CoTaskMemFree(endpointIDPtr)
+
+	var endpointIDChars []uint16
+	for charPtr := unsafe.Pointer(endpointIDPtr); ; charPtr = unsafe.Pointer(uintptr(charPtr) + unsafe.Sizeof(uint16(0))) {
+		char := *(*uint16)(charPtr)
+		if char == 0 {
+			break
+		}
+		endpointIDChars = append(endpointIDChars, char)
+	}
+
+	return syscall.UTF16ToString(endpointIDChars), nil
 }
 
 func setPersistedProcessEndpoint(processID uint32, endpointID string) error {

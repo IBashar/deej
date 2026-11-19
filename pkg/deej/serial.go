@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jacobsa/go-serial/serial"
@@ -36,6 +37,7 @@ type SerialIO struct {
 	sliderButtonConsumers []chan SliderButtonEvent
 	lastButtonStates      []bool
 	buttonStatesReady     bool
+	stateLock             sync.RWMutex
 }
 
 // SliderMoveEvent represents a single slider move captured by deej
@@ -117,9 +119,10 @@ func (sio *SerialIO) Start() error {
 		minimumReadSize = 1
 	}
 
+	config := sio.deej.config.snapshot()
 	sio.connOptions = serial.OpenOptions{
-		PortName:        sio.deej.config.ConnectionInfo.COMPort,
-		BaudRate:        uint(sio.deej.config.ConnectionInfo.BaudRate),
+		PortName:        config.COMPort,
+		BaudRate:        uint(config.BaudRate),
 		DataBits:        8,
 		StopBits:        1,
 		MinimumReadSize: uint(minimumReadSize),
@@ -189,6 +192,15 @@ func (sio *SerialIO) SubscribeToSliderButtonEvents() chan SliderButtonEvent {
 	return ch
 }
 
+// SliderState returns the current number of sliders and their normalized values.
+func (sio *SerialIO) SliderState() (int, []float32) {
+	sio.stateLock.RLock()
+	defer sio.stateLock.RUnlock()
+
+	values := append([]float32(nil), sio.currentSliderPercentValues...)
+	return len(values), values
+}
+
 func (sio *SerialIO) setupOnConfigReload() {
 	configReloadedChannel := sio.deej.config.SubscribeToChanges()
 
@@ -210,8 +222,9 @@ func (sio *SerialIO) setupOnConfigReload() {
 				}()
 
 				// if connection params have changed, attempt to stop and start the connection
-				if sio.deej.config.ConnectionInfo.COMPort != sio.connOptions.PortName ||
-					uint(sio.deej.config.ConnectionInfo.BaudRate) != sio.connOptions.BaudRate {
+				config := sio.deej.config.snapshot()
+				if config.COMPort != sio.connOptions.PortName ||
+					uint(config.BaudRate) != sio.connOptions.BaudRate {
 
 					sio.logger.Info("Detected change in connection parameters, attempting to renew connection")
 					sio.Stop()
@@ -279,22 +292,28 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 		return
 	}
 	numSliders := len(sliderValues)
+	config := sio.deej.config.snapshot()
 
 	// update our slider count, if needed - this will send slider move events for all
 	if numSliders != sio.lastKnownNumSliders {
 		logger.Infow("Detected sliders", "amount", numSliders)
 		sio.lastKnownNumSliders = numSliders
+		sio.stateLock.Lock()
 		sio.currentSliderPercentValues = make([]float32, numSliders)
 
 		// reset everything to be an impossible value to force the slider move event later
 		for idx := range sio.currentSliderPercentValues {
 			sio.currentSliderPercentValues[idx] = -1.0
 		}
+		sio.stateLock.Unlock()
 	}
 
 	// for each slider:
 	moveEvents := []SliderMoveEvent{}
 	for sliderIdx, number := range sliderValues {
+		sio.stateLock.RLock()
+		currentValue := sio.currentSliderPercentValues[sliderIdx]
+		sio.stateLock.RUnlock()
 
 		// map the value from raw to a "dirty" float between 0 and 1 (e.g. 0.15451...)
 		dirtyFloat := float32(number) / 1023.0
@@ -303,15 +322,17 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 		normalizedScalar := util.NormalizeScalar(dirtyFloat)
 
 		// if sliders are inverted, take the complement of 1.0
-		if sio.deej.config.InvertSliders {
+		if config.InvertSliders {
 			normalizedScalar = 1 - normalizedScalar
 		}
 
 		// check if it changes the desired state (could just be a jumpy raw slider value)
-		if util.SignificantlyDifferent(sio.currentSliderPercentValues[sliderIdx], normalizedScalar, sio.deej.config.NoiseReductionLevel) {
+		if util.SignificantlyDifferent(currentValue, normalizedScalar, config.NoiseReductionLevel) {
 
 			// if it does, update the saved value and create a move event
+			sio.stateLock.Lock()
 			sio.currentSliderPercentValues[sliderIdx] = normalizedScalar
+			sio.stateLock.Unlock()
 
 			moveEvents = append(moveEvents, SliderMoveEvent{
 				SliderID:     sliderIdx,

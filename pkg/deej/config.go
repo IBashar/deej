@@ -1,9 +1,13 @@
 package deej
 
 import (
+	"bytes"
 	"fmt"
+	"io/ioutil"
+	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -36,11 +40,36 @@ type CanonicalConfig struct {
 
 	userConfig     *viper.Viper
 	internalConfig *viper.Viper
+	loadLock       sync.Mutex
+	configLock     sync.RWMutex
 }
 
 type AudioOutputChoices struct {
 	Default   string
 	Alternate string
+}
+
+type canonicalConfigSnapshot struct {
+	SliderMapping       *sliderMap
+	AudioOutputs        AudioOutputChoices
+	COMPort             string
+	BaudRate            int
+	InvertSliders       bool
+	NoiseReductionLevel string
+}
+
+func (cc *CanonicalConfig) snapshot() canonicalConfigSnapshot {
+	cc.configLock.RLock()
+	defer cc.configLock.RUnlock()
+
+	return canonicalConfigSnapshot{
+		SliderMapping:       cc.SliderMapping,
+		AudioOutputs:        cc.AudioOutputs,
+		COMPort:             cc.ConnectionInfo.COMPort,
+		BaudRate:            cc.ConnectionInfo.BaudRate,
+		InvertSliders:       cc.InvertSliders,
+		NoiseReductionLevel: cc.NoiseReductionLevel,
+	}
 }
 
 const (
@@ -112,6 +141,9 @@ func NewConfig(logger *zap.SugaredLogger, notifier Notifier) (*CanonicalConfig, 
 
 // Load reads deej's config files from disk and tries to parse them
 func (cc *CanonicalConfig) Load() error {
+	cc.loadLock.Lock()
+	defer cc.loadLock.Unlock()
+
 	cc.logger.Debugw("Loading config", "path", userConfigFilepath)
 
 	// make sure it exists
@@ -150,12 +182,67 @@ func (cc *CanonicalConfig) Load() error {
 	}
 
 	cc.logger.Info("Loaded config successfully")
+	config := cc.snapshot()
 	cc.logger.Infow("Config values",
-		"sliderMapping", cc.SliderMapping,
-		"connectionInfo", cc.ConnectionInfo,
-		"invertSliders", cc.InvertSliders)
+		"sliderMapping", config.SliderMapping,
+		"comPort", config.COMPort,
+		"baudRate", config.BaudRate,
+		"invertSliders", config.InvertSliders)
 
 	return nil
+}
+
+// ApplyUserConfig validates and atomically applies new user configuration text.
+func (cc *CanonicalConfig) ApplyUserConfig(contents []byte) error {
+	candidate := viper.New()
+	candidate.SetConfigType(configType)
+	if err := candidate.ReadConfig(bytes.NewReader(contents)); err != nil {
+		return fmt.Errorf("validate user config: %w", err)
+	}
+
+	original, err := ioutil.ReadFile(userConfigFilepath)
+	if err != nil {
+		return fmt.Errorf("read existing user config: %w", err)
+	}
+	if err := replaceUserConfig(contents); err != nil {
+		return fmt.Errorf("write user config: %w", err)
+	}
+	if err := cc.Load(); err != nil {
+		restoreErr := replaceUserConfig(original)
+		if restoreErr != nil {
+			return fmt.Errorf("apply config: %v; restore previous config: %w", err, restoreErr)
+		}
+		return fmt.Errorf("apply config: %w", err)
+	}
+
+	cc.onConfigReloaded()
+	return nil
+}
+
+func replaceUserConfig(contents []byte) error {
+	tempFile, err := ioutil.TempFile(userConfigPath, ".deej-config-*.yaml")
+	if err != nil {
+		return err
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+	mode := os.FileMode(0644)
+	if info, err := os.Stat(userConfigFilepath); err == nil {
+		mode = info.Mode().Perm()
+	}
+	if err := tempFile.Chmod(mode); err != nil {
+		tempFile.Close()
+		return err
+	}
+
+	if _, err := tempFile.Write(contents); err != nil {
+		tempFile.Close()
+		return err
+	}
+	if err := tempFile.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, userConfigFilepath)
 }
 
 // SubscribeToChanges allows external components to receive updates when the config is reloaded
@@ -225,31 +312,40 @@ func (cc *CanonicalConfig) StopWatchingConfigFile() {
 func (cc *CanonicalConfig) populateFromVipers() error {
 
 	// merge the slider mappings from the user and internal configs
-	cc.SliderMapping = sliderMapFromConfigs(
+	sliderMapping := sliderMapFromConfigs(
 		cc.userConfig.GetStringMapStringSlice(configKeySliderMapping),
 		cc.internalConfig.GetStringMapStringSlice(configKeySliderMapping),
 	)
 	outputChoices := cc.userConfig.GetStringMapString(configKeyAudioOutputs)
-	cc.AudioOutputs = AudioOutputChoices{
+	audioOutputs := AudioOutputChoices{
 		Default:   strings.TrimSpace(outputChoices["default"]),
 		Alternate: strings.TrimSpace(outputChoices["alternate"]),
 	}
 
 	// get the rest of the config fields - viper saves us a lot of effort here
-	cc.ConnectionInfo.COMPort = cc.userConfig.GetString(configKeyCOMPort)
+	comPort := cc.userConfig.GetString(configKeyCOMPort)
 
-	cc.ConnectionInfo.BaudRate = cc.userConfig.GetInt(configKeyBaudRate)
-	if cc.ConnectionInfo.BaudRate <= 0 {
+	baudRate := cc.userConfig.GetInt(configKeyBaudRate)
+	if baudRate <= 0 {
 		cc.logger.Warnw("Invalid baud rate specified, using default value",
 			"key", configKeyBaudRate,
-			"invalidValue", cc.ConnectionInfo.BaudRate,
+			"invalidValue", baudRate,
 			"defaultValue", defaultBaudRate)
 
-		cc.ConnectionInfo.BaudRate = defaultBaudRate
+		baudRate = defaultBaudRate
 	}
 
-	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
-	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
+	invertSliders := cc.userConfig.GetBool(configKeyInvertSliders)
+	noiseReductionLevel := cc.userConfig.GetString(configKeyNoiseReductionLevel)
+
+	cc.configLock.Lock()
+	cc.SliderMapping = sliderMapping
+	cc.AudioOutputs = audioOutputs
+	cc.ConnectionInfo.COMPort = comPort
+	cc.ConnectionInfo.BaudRate = baudRate
+	cc.InvertSliders = invertSliders
+	cc.NoiseReductionLevel = noiseReductionLevel
+	cc.configLock.Unlock()
 
 	cc.logger.Debug("Populated config fields from vipers")
 

@@ -20,6 +20,12 @@ func (d *Deej) initializeTray(onDone func()) {
 		editConfig := systray.AddMenuItem("Edit configuration", "Open config file with notepad")
 		editConfig.SetIcon(icon.EditConfig)
 
+		var openUIClicks chan struct{}
+		if !util.Linux() {
+			openUI := systray.AddMenuItem("Open deej UI", "View sliders and edit configuration")
+			openUIClicks = openUI.ClickedCh
+		}
+
 		refreshSessions := systray.AddMenuItem("Re-scan audio sessions", "Manually refresh audio sessions if something's stuck")
 		refreshSessions.SetIcon(icon.RefreshSessions)
 
@@ -55,6 +61,11 @@ func (d *Deej) initializeTray(onDone func()) {
 					if err := util.OpenExternal(logger, editor, userConfigFilepath); err != nil {
 						logger.Warnw("Failed to open config file for editing", "error", err)
 					}
+
+				// open UI
+				case <-openUIClicks:
+					logger.Info("Open deej UI menu item clicked")
+					go d.openWindow()
 
 				// refresh sessions
 				case <-refreshSessions.ClickedCh:

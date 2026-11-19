@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
+	"sync"
 
 	"go.uber.org/zap"
 
@@ -29,6 +31,16 @@ type Deej struct {
 	stopChannel chan bool
 	version     string
 	verbose     bool
+
+	windowLock sync.Mutex
+	windowOpen bool
+	uiPreview  bool
+
+	uiStateLock    sync.RWMutex
+	uiSliderValues []float32
+	uiButtonStates []bool
+	uiButtonKnown  bool
+	uiStopChannel  chan struct{}
 }
 
 // NewDeej creates a Deej instance
@@ -48,11 +60,12 @@ func NewDeej(logger *zap.SugaredLogger, verbose bool) (*Deej, error) {
 	}
 
 	d := &Deej{
-		logger:      logger,
-		notifier:    notifier,
-		config:      config,
-		stopChannel: make(chan bool),
-		verbose:     verbose,
+		logger:        logger,
+		notifier:      notifier,
+		config:        config,
+		stopChannel:   make(chan bool),
+		uiStopChannel: make(chan struct{}),
+		verbose:       verbose,
 	}
 
 	serial, err := NewSerialIO(d, logger)
@@ -98,18 +111,28 @@ func (d *Deej) Initialize() error {
 		return fmt.Errorf("init session map: %w", err)
 	}
 
+	d.startUIStateMonitor()
+
+	d.setupInterruptHandler()
+
 	// decide whether to run with/without tray
 	if _, noTraySet := os.LookupEnv(envNoTray); noTraySet {
 
 		d.logger.Debugw("Running without tray icon", "reason", "envvar set")
 
 		// run in main thread while waiting on ctrl+C
-		d.setupInterruptHandler()
+		if runtime.GOOS == "windows" {
+			go d.openWindow()
+		}
 		d.run()
 
 	} else {
-		d.setupInterruptHandler()
-		d.initializeTray(d.run)
+		d.initializeTray(func() {
+			if runtime.GOOS == "windows" {
+				go d.openWindow()
+			}
+			d.run()
+		})
 	}
 
 	return nil
@@ -148,23 +171,23 @@ func (d *Deej) run() {
 
 			// If the port is busy, that's because something else is connected - notify and quit
 			if errors.Is(err, os.ErrPermission) {
+				config := d.config.snapshot()
 				d.logger.Warnw("Serial port seems busy, notifying user and closing",
-					"comPort", d.config.ConnectionInfo.COMPort)
+					"comPort", config.COMPort)
 
-				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
+				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", config.COMPort),
 					"This serial port is busy, make sure to close any serial monitor or other deej instance.")
 
 				d.signalStop()
 
 				// also notify if the COM port they gave isn't found, maybe their config is wrong
 			} else if errors.Is(err, os.ErrNotExist) {
-				d.logger.Warnw("Provided COM port seems wrong, notifying user and closing",
-					"comPort", d.config.ConnectionInfo.COMPort)
+				config := d.config.snapshot()
+				d.logger.Warnw("Provided COM port is unavailable; continuing without serial hardware",
+					"comPort", config.COMPort)
 
-				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
-					"This serial port doesn't exist, check your configuration and make sure it's set correctly.")
-
-				d.signalStop()
+				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", config.COMPort),
+					"This serial port doesn't exist. Deej will keep running; check the configuration to reconnect.")
 			}
 		}
 	}()
@@ -192,6 +215,7 @@ func (d *Deej) stop() error {
 
 	d.config.StopWatchingConfigFile()
 	d.serial.Stop()
+	close(d.uiStopChannel)
 
 	// release the session map
 	if err := d.sessions.release(); err != nil {

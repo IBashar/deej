@@ -51,6 +51,7 @@ deej is written in Go and [distributed](https://github.com/omriharel/deej/releas
 - Control your microphone's input level
 - Lightweight desktop client, consuming around 10MB of memory
 - Runs from your system tray
+- Whenever Deej is launched on Windows, it opens a resizable UI with read-only physical slider positions and pre-master output modifiers; app mappings and settings remain editable, and the modifiers scale app-session levels without changing Windows endpoint master volume
 - Helpful notifications to let you know if something isn't working
 
 > **Looking for the older Python version?** It's no longer maintained, but you can always find it in the [`legacy-python` branch](https://github.com/omriharel/deej/tree/legacy-python).

@@ -12,12 +12,14 @@ var (
 	versionTag string
 	buildType  string
 
-	verbose bool
+	verbose   bool
+	uiPreview bool
 )
 
 func init() {
 	flag.BoolVar(&verbose, "verbose", false, "show verbose logs (useful for debugging serial)")
 	flag.BoolVar(&verbose, "v", false, "shorthand for --verbose")
+	flag.BoolVar(&uiPreview, "ui-preview", false, "open a read-only UI preview without connecting to hardware")
 	flag.Parse()
 }
 
@@ -57,6 +59,13 @@ func main() {
 
 		versionString := fmt.Sprintf("Version %s-%s", buildType, identifier)
 		d.SetVersion(versionString)
+	}
+
+	if uiPreview {
+		if err := d.RunUIPreview(); err != nil {
+			named.Fatalw("Failed to open UI preview", "error", err)
+		}
+		return
 	}
 
 	// onwards, to glory

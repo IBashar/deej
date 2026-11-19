@@ -3,6 +3,8 @@ package deej
 import (
 	"fmt"
 	"regexp"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +29,10 @@ type sessionMap struct {
 	outputLock       sync.Mutex
 	outputEnabled    map[int]bool
 	outputStateKnown map[int]bool
+	sliderValues     map[int]float32
+
+	defaultOutputModifier   float32
+	alternateOutputModifier float32
 }
 
 type processIDSession interface {
@@ -38,6 +44,10 @@ type processOutputRouter interface {
 }
 
 const (
+	applicationSliderCount          = 5
+	defaultOutputModifierSliderID   = applicationSliderCount
+	alternateOutputModifierSliderID = applicationSliderCount + 1
+
 	masterSessionName = "master" // master device volume
 	systemSessionName = "system" // system sounds volume
 	inputSessionName  = "mic"    // microphone input level
@@ -73,13 +83,16 @@ func newSessionMap(deej *Deej, logger *zap.SugaredLogger, sessionFinder SessionF
 	logger = logger.Named("sessions")
 
 	m := &sessionMap{
-		deej:             deej,
-		logger:           logger,
-		m:                make(map[string][]Session),
-		lock:             &sync.Mutex{},
-		sessionFinder:    sessionFinder,
-		outputEnabled:    make(map[int]bool),
-		outputStateKnown: make(map[int]bool),
+		deej:                    deej,
+		logger:                  logger,
+		m:                       make(map[string][]Session),
+		lock:                    &sync.Mutex{},
+		sessionFinder:           sessionFinder,
+		outputEnabled:           make(map[int]bool),
+		outputStateKnown:        make(map[int]bool),
+		sliderValues:            make(map[int]float32),
+		defaultOutputModifier:   1,
+		alternateOutputModifier: 1,
 	}
 
 	logger.Debug("Created session map instance")
@@ -132,12 +145,15 @@ func (m *sessionMap) getAndAddSessions() error {
 		}
 	}
 
-	for sliderID := 0; sliderID < 5; sliderID++ {
+	for sliderID := 0; sliderID < applicationSliderCount; sliderID++ {
 		m.outputLock.Lock()
 		stateKnown := m.outputStateKnown[sliderID]
 		m.outputLock.Unlock()
 		if stateKnown {
 			m.applySliderOutput(sliderID)
+		}
+		if runtime.GOOS == "windows" {
+			m.reapplySliderValue(sliderID)
 		}
 	}
 
@@ -180,31 +196,36 @@ func (m *sessionMap) setupOnSliderButtonPress() {
 		for {
 			select {
 			case event := <-buttonEventsChannel:
-				if event.ButtonID < 0 || event.ButtonID >= 5 {
+				if event.ButtonID < 0 || event.ButtonID >= applicationSliderCount {
 					continue
 				}
 
+				alternateOutput := !event.IsOn
 				m.outputLock.Lock()
-				m.outputEnabled[event.ButtonID] = event.IsOn
+				m.outputEnabled[event.ButtonID] = alternateOutput
 				m.outputStateKnown[event.ButtonID] = true
 				m.outputLock.Unlock()
 
-				m.logger.Infow("Updated slider output switch", "sliderID", event.ButtonID, "alternateOutput", event.IsOn)
+				m.logger.Infow("Updated slider output switch", "sliderID", event.ButtonID, "alternateOutput", alternateOutput)
 				m.applySliderOutput(event.ButtonID)
+				if runtime.GOOS == "windows" {
+					m.reapplySliderValue(event.ButtonID)
+				}
 			}
 		}
 	}()
 }
 
 func (m *sessionMap) applySliderOutput(sliderID int) {
-	if sliderID < 0 || sliderID >= 5 {
+	if sliderID < 0 || sliderID >= applicationSliderCount {
 		return
 	}
-	if !strings.EqualFold(m.deej.config.AudioOutputs.Default, "default") {
-		m.logger.Warnw("audio_outputs.default must be 'default'", "value", m.deej.config.AudioOutputs.Default)
+	config := m.deej.config.snapshot()
+	if !strings.EqualFold(config.AudioOutputs.Default, "default") {
+		m.logger.Warnw("audio_outputs.default must be 'default'", "value", config.AudioOutputs.Default)
 		return
 	}
-	if m.deej.config.AudioOutputs.Alternate == "" {
+	if config.AudioOutputs.Alternate == "" {
 		m.logger.Warn("Configure audio_outputs.alternate before using output switches")
 		return
 	}
@@ -218,11 +239,11 @@ func (m *sessionMap) applySliderOutput(sliderID int) {
 	endpointName := ""
 	m.outputLock.Lock()
 	if m.outputEnabled[sliderID] {
-		endpointName = m.deej.config.AudioOutputs.Alternate
+		endpointName = config.AudioOutputs.Alternate
 	}
 	m.outputLock.Unlock()
 
-	targets, ok := m.deej.config.SliderMapping.get(sliderID)
+	targets, ok := config.SliderMapping.get(sliderID)
 	if !ok {
 		return
 	}
@@ -276,6 +297,7 @@ func (m *sessionMap) refreshSessions(force bool) {
 // special sessions (master, system, mic) and device-specific sessions always count as mapped,
 // even when absent from the config. this makes sense for every current feature that uses "unmapped sessions"
 func (m *sessionMap) sessionMapped(session Session) bool {
+	config := m.deej.config.snapshot()
 
 	// count master/system/mic as mapped
 	if funk.ContainsString([]string{masterSessionName, systemSessionName, inputSessionName}, session.Key()) {
@@ -290,7 +312,7 @@ func (m *sessionMap) sessionMapped(session Session) bool {
 	matchFound := false
 
 	// look through the actual mappings
-	m.deej.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
+	config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
 		for _, target := range targets {
 
 			// ignore special transforms
@@ -319,8 +341,76 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 		m.refreshSessions(true)
 	}
 
+	if runtime.GOOS == "windows" {
+		switch event.SliderID {
+		case defaultOutputModifierSliderID:
+			m.setOutputModifier(false, event.PercentValue)
+			return
+		case alternateOutputModifierSliderID:
+			m.setOutputModifier(true, event.PercentValue)
+			return
+		}
+	}
+
+	if event.SliderID >= 0 && event.SliderID < applicationSliderCount {
+		m.outputLock.Lock()
+		m.sliderValues[event.SliderID] = event.PercentValue
+		m.outputLock.Unlock()
+	}
+
+	m.applySliderValue(event.SliderID, event.PercentValue)
+}
+
+func (m *sessionMap) setOutputModifier(alternate bool, value float32) {
+	m.outputLock.Lock()
+	if alternate {
+		m.alternateOutputModifier = value
+	} else {
+		m.defaultOutputModifier = value
+	}
+	m.outputLock.Unlock()
+
+	m.reapplyOutputSliders()
+}
+
+func (m *sessionMap) outputModifierForSlider(sliderID int) float32 {
+	if runtime.GOOS != "windows" || sliderID < 0 || sliderID >= applicationSliderCount {
+		return 1
+	}
+	m.outputLock.Lock()
+	defer m.outputLock.Unlock()
+
+	if m.outputEnabled[sliderID] {
+		return m.alternateOutputModifier
+	}
+	return m.defaultOutputModifier
+}
+
+func (m *sessionMap) reapplyOutputSliders() {
+	m.outputLock.Lock()
+	values := make(map[int]float32, len(m.sliderValues))
+	for sliderID, value := range m.sliderValues {
+		values[sliderID] = value
+	}
+	m.outputLock.Unlock()
+
+	for sliderID, value := range values {
+		m.applySliderValue(sliderID, value)
+	}
+}
+
+func (m *sessionMap) reapplySliderValue(sliderID int) {
+	m.outputLock.Lock()
+	value, ok := m.sliderValues[sliderID]
+	m.outputLock.Unlock()
+	if ok {
+		m.applySliderValue(sliderID, value)
+	}
+}
+
+func (m *sessionMap) applySliderValue(sliderID int, value float32) {
 	// get the targets mapped to this slider from the config
-	targets, ok := m.deej.config.SliderMapping.get(event.SliderID)
+	targets, ok := m.deej.config.snapshot().SliderMapping.get(sliderID)
 
 	// if slider not found in config, silently ignore
 	if !ok {
@@ -352,8 +442,9 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 
 			// iterate all matching sessions and adjust the volume of each one
 			for _, session := range sessions {
-				if session.GetVolume() != event.PercentValue {
-					if err := session.SetVolume(event.PercentValue); err != nil {
+				sessionValue := value * m.outputModifierForSession(sliderID, session)
+				if session.GetVolume() != sessionValue {
+					if err := session.SetVolume(sessionValue); err != nil {
 						m.logger.Warnw("Failed to set target session volume", "error", err)
 						adjustmentFailed = true
 					}
@@ -374,6 +465,18 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 		// (or another, more catastrophic failure happens)
 		m.refreshSessions(true)
 	}
+}
+
+func (m *sessionMap) outputModifierForSession(sliderID int, session Session) float32 {
+	if processSession, ok := session.(processIDSession); ok && processSession.ProcessID() != 0 {
+		return m.outputModifierForSlider(sliderID)
+	}
+	if runtime.GOOS == "windows" && strings.EqualFold(session.Key(), systemSessionName) {
+		m.outputLock.Lock()
+		defer m.outputLock.Unlock()
+		return m.defaultOutputModifier
+	}
+	return 1
 }
 
 func (m *sessionMap) targetHasSpecialTransform(target string) bool {
@@ -448,6 +551,56 @@ func (m *sessionMap) get(key string) ([]Session, bool) {
 
 	value, ok := m.m[key]
 	return value, ok
+}
+
+func (m *sessionMap) availableApplications() []string {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	applications := make([]string, 0, len(m.m))
+	for key := range m.m {
+		if strings.HasSuffix(strings.ToLower(key), ".exe") {
+			applications = append(applications, key)
+		}
+	}
+	sort.Strings(applications)
+	return applications
+}
+
+func (m *sessionMap) sessionVolume(key string) (float32, bool) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	sessions, ok := m.m[strings.ToLower(key)]
+	if !ok || len(sessions) == 0 {
+		return 0, false
+	}
+	return sessions[0].GetVolume(), true
+}
+
+func (m *sessionMap) setSessionVolume(key string, value float32) error {
+	m.lock.Lock()
+	sessions, ok := m.m[strings.ToLower(key)]
+	if !ok || len(sessions) == 0 {
+		m.lock.Unlock()
+		return fmt.Errorf("audio endpoint %q is unavailable", key)
+	}
+	var refresh bool
+	for _, session := range sessions {
+		if err := session.SetVolume(value); err != nil {
+			if err == errRefreshSessions {
+				refresh = true
+				continue
+			}
+			m.lock.Unlock()
+			return err
+		}
+	}
+	m.lock.Unlock()
+	if refresh {
+		m.refreshSessions(true)
+	}
+	return nil
 }
 
 func (m *sessionMap) clear() {
